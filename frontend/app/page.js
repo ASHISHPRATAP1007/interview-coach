@@ -1,5 +1,5 @@
 'use client';
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
 const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 
@@ -108,6 +108,45 @@ function Mock({ role, notes }) {
   );
 }
 
+function encodeWav(f32, rate) {
+  const buf = new ArrayBuffer(44 + f32.length * 2);
+  const v = new DataView(buf);
+  const w = (o, str) => { for (let i = 0; i < str.length; i++) v.setUint8(o + i, str.charCodeAt(i)); };
+  w(0, 'RIFF'); v.setUint32(4, 36 + f32.length * 2, true); w(8, 'WAVE'); w(12, 'fmt ');
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  w(36, 'data'); v.setUint32(40, f32.length * 2, true);
+  let o = 44;
+  for (let i = 0; i < f32.length; i++, o += 2) {
+    const s = Math.max(-1, Math.min(1, f32[i]));
+    v.setInt16(o, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+  return buf;
+}
+
+function toBase64(buf) {
+  const bytes = new Uint8Array(buf);
+  let b = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) b += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(b);
+}
+
+function downsample(data, from, to) {
+  if (from <= to) return data;
+  const ratio = from / to;
+  const n = Math.floor(data.length / ratio);
+  const out = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const s = Math.floor(i * ratio), e = Math.max(s + 1, Math.floor((i + 1) * ratio));
+    let sum = 0;
+    for (let j = s; j < e; j++) sum += data[j];
+    out[i] = sum / (e - s);
+  }
+  return out;
+}
+
+const QUESTION_RE = /\?|\b(kya|kaise|kyun|kyon|kab|kaun|kitna|what|how|why|when|who|which|tell me|explain|describe|walk me)\b/i;
+
 function Live({ role, notes }) {
   const [transcript, setTranscript] = useState('');
   const [auto, setAuto] = useState(true);
@@ -115,38 +154,135 @@ function Live({ role, notes }) {
   const [nts, setNts] = useState('');
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
+  const [tabOn, setTabOn] = useState(false);
+  const [tabMsg, setTabMsg] = useState('');
   const tRef = useRef('');
   const autoRef = useRef(true);
+  const rnRef = useRef({ role, notes });
+  const inflight = useRef(false);
+  const tab = useRef(null);
   autoRef.current = auto;
+  rnRef.current = { role, notes };
 
   const set = (v) => { tRef.current = v; setTranscript(v); };
+  const append = (who, t) => {
+    const next = (tRef.current ? tRef.current + '\n' : '') + who + ': ' + t;
+    set(next);
+    return next;
+  };
 
   async function call(path, setter, text) {
+    if (inflight.current) return;
+    inflight.current = true;
     setBusy(true); setErr('');
-    try { setter(await api(path, { role, notes, transcript: text })); }
+    try { setter(await api(path, { ...rnRef.current, transcript: text })); }
     catch (e) { setErr(e.message); }
+    inflight.current = false;
     setBusy(false);
   }
+
+  // Aapki apni awaaz (mic)
   const speech = useSpeech((t) => {
-    const next = (tRef.current ? tRef.current + ' ' : '') + t;
-    set(next);
-    if (autoRef.current && t.endsWith('?')) call('suggest', setSug, next);
+    const next = append('Aap', t);
+    if (autoRef.current && QUESTION_RE.test(t)) call('suggest', setSug, next);
   });
+
+  // Dusre vyakti ki awaaz (browser tab ki audio)
+  async function sendChunk(all, rate) {
+    const data = downsample(all, rate, 16000);
+    let sum = 0;
+    for (let i = 0; i < data.length; i += 8) sum += data[i] * data[i];
+    if (Math.sqrt(sum / (data.length / 8)) < 0.004) return; // khamoshi, skip
+    try {
+      const wav = encodeWav(data, Math.min(rate, 16000));
+      const text = await api('transcribe', { audio: toBase64(wav), mime: 'audio/wav' });
+      if (text && text.trim()) {
+        const next = append('Interviewer', text.trim());
+        if (autoRef.current) call('suggest', setSug, next);
+      }
+    } catch (e) { setTabMsg(e.message); }
+  }
+
+  function stopTab() {
+    const t = tab.current;
+    if (!t) return;
+    try { t.proc.disconnect(); t.src.disconnect(); t.ctx.close(); } catch (e) {}
+    t.stream.getTracks().forEach((x) => x.stop());
+    tab.current = null;
+    setTabOn(false);
+  }
+
+  async function startTab() {
+    if (tabOn) { stopTab(); return; }
+    setTabMsg('');
+    try {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+        setTabMsg('Ye browser tab ki awaaz capture nahi kar sakta. Computer par Chrome ya Edge use karo.');
+        return;
+      }
+      const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+      const at = stream.getAudioTracks();
+      if (!at.length) {
+        stream.getTracks().forEach((x) => x.stop());
+        setTabMsg('Awaaz share nahi hui. Dobara try karo, aur "Also share tab audio" tick karna na bhulo.');
+        return;
+      }
+      const ctx = new AudioContext();
+      const src = ctx.createMediaStreamSource(new MediaStream(at));
+      const proc = ctx.createScriptProcessor(4096, 1, 1);
+      let bufs = [], len = 0;
+      const need = ctx.sampleRate * 10; // har 10 second ka tukda
+      proc.onaudioprocess = (e) => {
+        const c = new Float32Array(e.inputBuffer.getChannelData(0));
+        bufs.push(c); len += c.length;
+        if (len >= need) {
+          const all = new Float32Array(len);
+          let o = 0;
+          for (const b of bufs) { all.set(b, o); o += b.length; }
+          bufs = []; len = 0;
+          sendChunk(all, ctx.sampleRate);
+        }
+      };
+      src.connect(proc);
+      proc.connect(ctx.destination);
+      stream.getVideoTracks().forEach((v) => { v.onended = stopTab; });
+      tab.current = { stream, ctx, proc, src };
+      setTabOn(true);
+    } catch (e) {
+      setTabMsg('Tab share shuru nahi hua. Permission dena zaroori hai.');
+    }
+  }
+
+  useEffect(() => () => stopTab(), []);
 
   return (
     <section className="space-y-3">
+      <div className="rounded-md border border-slate-200 bg-white p-3 text-sm dark:border-slate-800 dark:bg-slate-900">
+        <p className="font-medium">Dusre vyakti ki awaaz kaise pakdein</p>
+        <ol className="ml-5 list-decimal space-y-1 text-slate-600 dark:text-slate-400">
+          <li>Computer par Chrome ya Edge mein call (Meet, Zoom web, Teams web) ek tab mein kholo.</li>
+          <li>Neeche <b>Tab ki awaaz suno</b> dabao, wo tab chuno, aur <b>Also share tab audio</b> tick karo.</li>
+          <li>Interviewer jo bolega wo transcript mein "Interviewer:" ke saath aayega, aur AI jawab suggest karega.</li>
+        </ol>
+        <p className="mt-1 text-slate-500">Browser upar sharing ka nishaan dikhata rehta hai. Call mein sabko batao ki aap AI assistant use kar rahe ho.</p>
+      </div>
       <div className="flex flex-wrap items-center gap-2">
-        <button className={btnCls} onClick={speech.toggle}>{speech.on ? 'Mic rokho' : 'Sunna shuru karo'}</button>
+        <button className={btnCls} onClick={startTab}>{tabOn ? 'Tab sunna rokho' : 'Tab ki awaaz suno'}</button>
+        <button className={btn2Cls} onClick={speech.toggle}>{speech.on ? 'Mic rokho' : 'Meri awaaz (mic) suno'}</button>
         <button className={btn2Cls} disabled={busy || !transcript.trim()} onClick={() => call('suggest', setSug, transcript)}>Jawab suggest karo</button>
         <button className={btn2Cls} disabled={busy || !transcript.trim()} onClick={() => call('notes', setNts, transcript)}>Notes banao</button>
         <label className="flex items-center gap-1 text-sm">
           <input type="checkbox" checked={auto} onChange={(e) => setAuto(e.target.checked)} /> Auto answer
         </label>
       </div>
-      <p className="text-sm text-slate-500">{speech.on ? 'Sun raha hoon…' : 'Mic band hai.'}</p>
+      <p className="text-sm text-slate-500">
+        {tabOn ? 'Tab ki awaaz sun raha hoon…' : 'Tab band hai.'} {speech.on ? 'Mic chalu hai.' : ''}
+      </p>
+      {tabMsg && <p className="text-sm text-red-600">{tabMsg}</p>}
       {speech.error && <p className="text-sm text-red-600">{speech.error}</p>}
       <label className="block text-sm font-medium" htmlFor="tr">Transcript (type ya paste bhi kar sakte ho)</label>
-      <textarea id="tr" rows={6} className={inputCls} value={transcript} onChange={(e) => set(e.target.value)} />
+      <textarea id="tr" rows={7} className={inputCls} value={transcript} onChange={(e) => set(e.target.value)}
+        placeholder={'Jaise:\nInterviewer: Apne baare mein batao?'} />
       {busy && <p className="text-sm text-slate-500">Soch raha hoon…</p>}
       {sug && <><h3 className="text-sm font-semibold">Suggested jawab</h3><Out text={sug} /></>}
       {nts && <><h3 className="text-sm font-semibold">AI Notes</h3><Out text={nts} /></>}
