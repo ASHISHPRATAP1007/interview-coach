@@ -1,14 +1,19 @@
 'use client';
 import { useEffect, useRef, useState } from 'react';
 
-const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+const API = process.env.NEXT_PUBLIC_API_URL || 'https://interview-coach-api-cpxr.onrender.com';
 
 async function api(path, body) {
-  const res = await fetch(`${API}/api/${path}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
+  let res;
+  try {
+    res = await fetch(`${API}/api/${path}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+  } catch (e) {
+    throw new Error(`API tak nahi pahunch paya (${API}). Neeche "Connection check" dabao.`);
+  }
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.detail || 'Kuch gadbad ho gayi. Dobara try karo.');
   return data.text;
@@ -291,10 +296,69 @@ function Live({ role, notes }) {
   );
 }
 
+function Status() {
+  const [out, setOut] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  async function check() {
+    setBusy(true);
+    setOut('Check ho raha hai… (free server ko jagne mein 60 second lag sakte hain)');
+    const lines = [`API ka URL: ${API}`];
+    try {
+      const r = await fetch(`${API}/health`);
+      const j = await r.json();
+      lines.push('Server: chal raha hai');
+      lines.push(`Gemini key: ${j.key_set ? 'set hai' : 'SET NAHI HAI (Render mein GEMINI_API_KEY daalo)'}`);
+      lines.push(`Model: ${j.model}`);
+      try {
+        const r2 = await fetch(`${API}/api/test`);
+        const j2 = await r2.json().catch(() => ({}));
+        lines.push(r2.ok ? `AI test: theek (${j2.text})` : `AI test fail: ${j2.detail || r2.status}`);
+      } catch (e) {
+        lines.push('AI test: request block hui (CORS). API mein FRONTEND_URL check karo.');
+      }
+    } catch (e) {
+      lines.push('Server tak nahi pahunch paya.');
+      if (API.includes('localhost')) {
+        lines.push('Wajah: web service ko API ka URL nahi mila. Render mein NEXT_PUBLIC_API_URL set karo aur web service dobara deploy karo.');
+      } else {
+        lines.push('Wajah: URL galat hai, ya API service so rahi hai (thodi der ruk kar dobara dabao), ya request block ho rahi hai.');
+      }
+    }
+    setOut(lines.join('\n'));
+    setBusy(false);
+  }
+
+  return (
+    <details className="rounded-md border border-slate-200 p-3 text-sm dark:border-slate-800">
+      <summary className="cursor-pointer font-medium">Kuch kaam nahi kar raha? Connection check</summary>
+      <div className="mt-2 space-y-2">
+        <button className={btn2Cls} onClick={check} disabled={busy}>Connection check</button>
+        {out && <pre className="whitespace-pre-wrap break-words rounded bg-slate-100 p-2 dark:bg-slate-900">{out}</pre>}
+      </div>
+    </details>
+  );
+}
+
 export default function Page() {
   const [tab, setTab] = useState('mock');
-  const [role, setRole] = useState('');
-  const [notes, setNotes] = useState('');
+  const [p, setP] = useState({ name: '', role: '', exp: '', skills: '', extra: '' });
+
+  useEffect(() => {
+    try { const s = localStorage.getItem('ic_profile'); if (s) setP(JSON.parse(s)); } catch (e) {}
+  }, []);
+  useEffect(() => {
+    try { localStorage.setItem('ic_profile', JSON.stringify(p)); } catch (e) {}
+  }, [p]);
+
+  const upd = (k) => (e) => setP({ ...p, [k]: e.target.value });
+  const role = p.role;
+  const notes = [
+    p.name && `Naam: ${p.name}`,
+    p.exp && `Experience: ${p.exp}`,
+    p.skills && `Skills: ${p.skills}`,
+    p.extra && `Resume ya notes: ${p.extra}`,
+  ].filter(Boolean).join('\n');
 
   return (
     <main className="mx-auto max-w-3xl space-y-5 px-4 py-6">
@@ -308,15 +372,28 @@ export default function Page() {
         Jahan AI mana hai (jaise proctored exam ya interview) wahan ise use mat karo.
       </p>
 
-      <div className="grid gap-3 sm:grid-cols-2">
-        <div>
-          <label className="mb-1 block text-sm font-medium" htmlFor="role">Role ya company</label>
-          <input id="role" className={inputCls} value={role} onChange={(e) => setRole(e.target.value)} placeholder="Jaise: Software Developer" />
+      <div className="rounded-md border border-slate-200 p-3 dark:border-slate-800">
+        <p className="mb-2 text-sm font-medium">Aapki basic details (AI inhe dekhkar aapke hisaab se jawab deta hai)</p>
+        <div className="grid gap-3 sm:grid-cols-2">
+          <div>
+            <label className="mb-1 block text-sm" htmlFor="name">Naam</label>
+            <input id="name" className={inputCls} value={p.name} onChange={upd('name')} />
+          </div>
+          <div>
+            <label className="mb-1 block text-sm" htmlFor="role">Role ya company</label>
+            <input id="role" className={inputCls} value={p.role} onChange={upd('role')} placeholder="Jaise: Software Developer" />
+          </div>
+          <div>
+            <label className="mb-1 block text-sm" htmlFor="exp">Experience</label>
+            <input id="exp" className={inputCls} value={p.exp} onChange={upd('exp')} placeholder="Jaise: Fresher ya 2 saal" />
+          </div>
+          <div>
+            <label className="mb-1 block text-sm" htmlFor="skills">Skills</label>
+            <input id="skills" className={inputCls} value={p.skills} onChange={upd('skills')} placeholder="Jaise: Python, React" />
+          </div>
         </div>
-        <div>
-          <label className="mb-1 block text-sm font-medium" htmlFor="notes">Resume ya notes (optional)</label>
-          <textarea id="notes" rows={2} className={inputCls} value={notes} onChange={(e) => setNotes(e.target.value)} />
-        </div>
+        <label className="mb-1 mt-3 block text-sm" htmlFor="extra">Resume ya projects (optional)</label>
+        <textarea id="extra" rows={3} className={inputCls} value={p.extra} onChange={upd('extra')} />
       </div>
 
       <div className="grid grid-cols-2 gap-1 rounded-lg bg-slate-200 p-1 dark:bg-slate-800" role="tablist">
@@ -329,6 +406,8 @@ export default function Page() {
       </div>
 
       {tab === 'mock' ? <Mock role={role} notes={notes} /> : <Live role={role} notes={notes} />}
+
+      <Status />
     </main>
   );
 }
