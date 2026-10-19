@@ -2,15 +2,15 @@ import os
 import time
 from collections import defaultdict, deque
 
-from anthropic import Anthropic, APIError
+import requests
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5-5")
+MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+API_KEY = os.getenv("GEMINI_API_KEY", "")
 MAX_REQ_PER_MIN = int(os.getenv("MAX_REQ_PER_MIN", "15"))
 
-client = Anthropic()  # ANTHROPIC_API_KEY env variable se key leta hai
 app = FastAPI(title="Interview Coach API")
 
 origins = [o.strip() for o in os.getenv("FRONTEND_URL", "http://localhost:3000").split(",") if o.strip()]
@@ -38,16 +38,27 @@ def check_rate(request: Request) -> None:
 
 
 def ask(prompt: str, max_tokens: int = 700) -> dict:
+    if not API_KEY:
+        raise HTTPException(status_code=500, detail="GEMINI_API_KEY set nahi hai.")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
+    body = {
+        "systemInstruction": {"parts": [{"text": SYSTEM}]},
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {"maxOutputTokens": max_tokens},
+    }
     try:
-        msg = client.messages.create(
-            model=MODEL,
-            max_tokens=max_tokens,
-            system=SYSTEM,
-            messages=[{"role": "user", "content": prompt}],
-        )
-    except APIError as e:
-        raise HTTPException(status_code=502, detail=f"AI se jawab nahi mila: {e.__class__.__name__}")
-    text = "".join(b.text for b in msg.content if b.type == "text")
+        r = requests.post(url, json=body, headers={"x-goog-api-key": API_KEY}, timeout=60)
+    except requests.RequestException:
+        raise HTTPException(status_code=502, detail="AI se connect nahi ho paya.")
+    if r.status_code == 429:
+        raise HTTPException(status_code=429, detail="AI ki free limit poori ho gayi. Thodi der baad try karo.")
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"AI se jawab nahi mila (code {r.status_code}). Model ka naam check karo.")
+    try:
+        parts = r.json()["candidates"][0]["content"]["parts"]
+        text = "".join(p.get("text", "") for p in parts)
+    except (KeyError, IndexError):
+        raise HTTPException(status_code=502, detail="AI ne khali jawab diya. Dobara try karo.")
     return {"text": text.strip()}
 
 
