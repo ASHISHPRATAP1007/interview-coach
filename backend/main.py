@@ -13,7 +13,7 @@ MAX_REQ_PER_MIN = int(os.getenv("MAX_REQ_PER_MIN", "30"))
 
 app = FastAPI(title="Interview Coach API")
 
-origins = [o.strip().rstrip("/") for o in os.getenv("FRONTEND_URL", "http://localhost:3000").split(",") if o.strip()]
+origins = [o.strip().rstrip("/") for o in os.getenv("FRONTEND_URL", "https://interview-coach-api.onrender.com").split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
@@ -49,8 +49,10 @@ def _generate(parts: list, max_tokens: int, system: str | None = SYSTEM) -> str:
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
     body = {
         "contents": [{"role": "user", "parts": parts}],
-        "generationConfig": {"maxOutputTokens": max_tokens},
+        "generationConfig": {"maxOutputTokens": max(max_tokens, 1500)},
     }
+    if "2.5-flash" in MODEL:
+        body["generationConfig"]["thinkingConfig"] = {"thinkingBudget": 0}
     if system:
         body["systemInstruction"] = {"parts": [{"text": system}]}
     try:
@@ -99,7 +101,13 @@ def ctx(b: Base) -> str:
 
 @app.get("/health")
 def health():
-    return {"ok": True}
+    return {"ok": True, "key_set": bool(API_KEY), "model": MODEL}
+
+
+@app.get("/api/test")
+def test(request: Request):
+    check_rate(request)
+    return ask("Sirf ek shabd likho: OK", max_tokens=200)
 
 
 @app.post("/api/question")
